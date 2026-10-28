@@ -150,9 +150,10 @@ class TVCacheClient:
         sandbox_id: Optional[str],
         runtime: int,
         ttl: Optional[int] = None,
+        embedding: Optional[List[float]] = None,
     ) -> InsertResult:
         response = await self._send_request(
-            protocol.encode_insert(task_id, path, value, sandbox_id, runtime, ttl)
+            protocol.encode_insert(task_id, path, value, sandbox_id, runtime, ttl, embedding)
         )
         return self._expect(response, InsertResult)
 

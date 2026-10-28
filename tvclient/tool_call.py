@@ -2,6 +2,9 @@
 
 import json
 from abc import ABC, abstractmethod
+from typing import List
+
+from tvclient.embedding import get_embedder
 
 
 class ToolCall(ABC):
@@ -25,6 +28,11 @@ class ToolCall(ABC):
         # sort_keys makes the serialization canonical so the same logical call
         # always produces the same cache key.
         return json.dumps(self.to_dict(), sort_keys=True)
+
+    def embed(self) -> List[float]:
+        """Embeds this call with the embedder from set_embedder(). Override to
+        embed different text or use a different model."""
+        return get_embedder().encode(self.serialize())
 
 
 class TestToolCall(ToolCall):

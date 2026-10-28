@@ -4,6 +4,9 @@ version = "0.1.0"
 description = "Async Python client for the TVCache stateful tool-value cache"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+embedding = ["sentence-transformers>=2.3"]
+
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"

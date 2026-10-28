@@ -135,6 +135,29 @@ def write_path(path: List[str]) -> bytes:
     return encoded
 
 
+# The most numbers an embedding can have. This is 2^16 - 1, because the
+# dimension is sent as a u16
+MAX_EMBEDDING_DIMENSION = 2**16 - 1
+
+# The largest number an f32 can hold, because embedding values are stored
+# as f32's
+MAX_FLOAT32 = 3.4028234663852886e38
+
+
+def validate_embedding(embedding: List[float]) -> None:
+    """Raises ValueError if the embedding can't be sent on the wire."""
+    if not 1 <= len(embedding) <= MAX_EMBEDDING_DIMENSION:
+        raise ValueError(f"embedding dimension {len(embedding)} is out of range")
+    # Also rejects NaN and infinity, which fail every comparison.
+    if not all(abs(x) <= MAX_FLOAT32 for x in embedding):
+        raise ValueError("embedding has values that don't fit in float32")
+
+
+def write_embedding(embedding: List[float]) -> bytes:
+    validate_embedding(embedding)
+    return struct.pack(f">H{len(embedding)}f", len(embedding), *embedding)
+
+
 def encode_insert(
     task_id: str,
     path: List[str],
@@ -142,6 +165,7 @@ def encode_insert(
     sandbox_id: Optional[str],
     runtime: int,
     ttl: Optional[int] = None,
+    embedding: Optional[List[float]] = None,
 ) -> bytes:
     encoded = write_u8(INSERT_REQUEST)
     encoded += write_string_u16(task_id)
@@ -159,6 +183,10 @@ def encode_insert(
     encoded += write_bool(ttl is not None)
     if ttl is not None:
         encoded += write_u32(ttl)
+
+    encoded += write_bool(embedding is not None)
+    if embedding is not None:
+        encoded += write_embedding(embedding)
 
     return encoded
 
