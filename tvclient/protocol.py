@@ -1,6 +1,6 @@
 """Binary wire protocol for the TVCache server.
 
-Request op bytes 1-8 and response type bytes 1-8, big-endian, with
+Request op bytes 1-10 and response type bytes 1-9, big-endian, with
 bool-prefixed optional fields. This module only knows how to encode request
 payloads and decode responses from an asyncio.StreamReader; connection
 handling lives in TVCacheClient.
