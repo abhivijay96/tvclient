@@ -19,7 +19,28 @@ class ToolCall(ABC):
 
     @abstractmethod
     def to_dict(self) -> dict:
+        """Returns the tool call as a dictionary.
+
+        INVARIANT: The dictionary must be representable in JSON, so that
+        json.loads(self.serialize()) == self.to_dict(). That is, use strings for
+        keys and strings, numbers, booleans, lists, dictionaries or None for
+        values. This also applies to nested lists and dictionaries.
+
+        Sort any collection whose order doesn't matter, such as a set, so the
+        same call always serializes the same way.
+        """
         ...
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ToolCall":
+        """Rebuilds a tool call from the dictionary produced by to_dict.
+
+        The rebuilt call must behave like the original when executed and
+        serialize the same, so
+        cls.from_dict(call.to_dict()).serialize() == call.serialize().
+        The default raises NotImplementedError.
+        """
+        raise NotImplementedError(f"{cls.__name__} does not implement from_dict")
 
     def will_mutate_state(self) -> bool:
         return True
@@ -30,8 +51,16 @@ class ToolCall(ABC):
         return json.dumps(self.to_dict(), sort_keys=True)
 
     def embed(self) -> List[float]:
-        """Embeds this call with the embedder from set_embedder(). Override to
-        embed different text or use a different model."""
+        """Embeds this call with the embedder from set_embedder().
+
+        By default, a tool call's serialization is embedded, which may make
+        different calls look alike because of shared JSON structure and keys.
+        We suggest that `embed` be overridden using the pattern
+
+        `get_embedder().encode(<tool call>)`
+
+        where `<tool call>` is how the tool call is being represented.
+        """
         return get_embedder().encode(self.serialize())
 
 
