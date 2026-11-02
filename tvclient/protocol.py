@@ -1,9 +1,8 @@
 """Binary wire protocol for the TVCache server.
 
-Request op bytes 1-8 and response type bytes 1-8, big-endian, with
-bool-prefixed optional fields. This module only knows how to encode request
-payloads and decode responses from an asyncio.StreamReader; connection
-handling lives in TVCacheClient.
+Requests and responses are big-endian, with bool-prefixed optional fields.
+This module only knows how to encode request payloads and decode responses
+from an asyncio.StreamReader; connection handling lives in TVCacheClient.
 """
 
 import asyncio
@@ -23,6 +22,7 @@ LIST_HOT_SANDBOXES_REQUEST = 8
 REPORT_FORK_COST_REQUEST = 9
 GET_FORK_COST_REQUEST = 10
 LEASE_SANDBOX_REQUEST = 11
+LIST_SIBLING_GROUPS_REQUEST = 12
 
 INSERT_RESULT_RESPONSE = 1
 FIND_RESULT_RESPONSE = 2
@@ -34,6 +34,7 @@ SANDBOX_CANDIDATES_RESPONSE = 7
 RECLAIMABLE_SANDBOXES_RESPONSE = 8
 FORK_COST_RESPONSE = 9
 LEASE_RESULT_RESPONSE = 10
+SIBLING_GROUPS_RESPONSE = 11
 
 
 class TVCacheServerError(Exception):
@@ -103,6 +104,43 @@ class SandboxEvictionRecord:
 @dataclass(frozen=True)
 class ForkCost:
     fork_cost_ms: int
+
+
+@dataclass(frozen=True)
+class Sibling:
+    """A child in a sibling group, named by any of its calls."""
+
+    calls: List[str]
+    settled: bool
+    has_snapshot: bool
+
+
+@dataclass(frozen=True)
+class SimilarPair:
+    """Two similar siblings, as indexes i < j into their group's children.
+
+    score is the highest cosine between the two siblings' call embeddings, as
+    an f32. The server already applied the threshold, so don't compare it again.
+    """
+
+    i: int
+    j: int
+    score: float
+
+
+@dataclass(frozen=True)
+class SiblingGroup:
+    """The siblings under parent_path that appear in at least one pair."""
+
+    parent_path: List[str]
+    children: List[Sibling]
+    pairs: List[SimilarPair]
+
+
+@dataclass(frozen=True)
+class SiblingGroups:
+    deeper_nodes_exist: bool
+    groups: List[SiblingGroup]
 
 
 @dataclass(frozen=True)
@@ -209,6 +247,15 @@ def encode_lease_sandbox(task_id: str, path: List[str]) -> bytes:
     )
 
 
+def encode_list_sibling_groups(task_id: str, depth: int, threshold: float) -> bytes:
+    return (
+        write_u8(LIST_SIBLING_GROUPS_REQUEST)
+        + write_string_u16(task_id)
+        + write_u16(depth)
+        + struct.pack(">f", threshold)
+    )
+
+
 def encode_dump_all() -> bytes:
     return write_u8(DUMP_ALL_REQUEST)
 
@@ -279,6 +326,10 @@ async def read_u64(reader: asyncio.StreamReader) -> int:
     return struct.unpack(">Q", await reader.readexactly(8))[0]
 
 
+async def read_f32(reader: asyncio.StreamReader) -> float:
+    return struct.unpack(">f", await reader.readexactly(4))[0]
+
+
 async def read_string_u16(reader: asyncio.StreamReader) -> str:
     return (await reader.readexactly(await read_u16(reader))).decode("utf-8")
 
@@ -317,6 +368,27 @@ async def read_sandbox_candidate(reader: asyncio.StreamReader) -> SandboxCandida
         sandbox_id=await read_string_u16(reader),
         score=await read_u64(reader),
     )
+
+
+async def read_sibling_group(reader: asyncio.StreamReader) -> SiblingGroup:
+    parent_path = await read_path(reader)
+    children = [
+        Sibling(
+            calls=await read_path(reader),
+            settled=await read_bool(reader),
+            has_snapshot=await read_bool(reader),
+        )
+        for _ in range(await read_u16(reader))
+    ]
+    pairs = [
+        SimilarPair(
+            i=await read_u16(reader),
+            j=await read_u16(reader),
+            score=await read_f32(reader),
+        )
+        for _ in range(await read_u32(reader))
+    ]
+    return SiblingGroup(parent_path=parent_path, children=children, pairs=pairs)
 
 
 async def decode_response(reader: asyncio.StreamReader) -> object:
@@ -373,6 +445,14 @@ async def decode_response(reader: asyncio.StreamReader) -> object:
         return LeaseResponse(
             sandbox_path=await read_optional_path(reader),
             sandbox_id=await read_optional_string_u16(reader),
+        )
+
+    if response_type == SIBLING_GROUPS_RESPONSE:
+        deeper_nodes_exist = await read_bool(reader)
+        count = await read_u16(reader)
+        return SiblingGroups(
+            deeper_nodes_exist=deeper_nodes_exist,
+            groups=[await read_sibling_group(reader) for _ in range(count)],
         )
 
     raise ValueError(f"unknown response type: {response_type}")

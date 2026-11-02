@@ -24,6 +24,7 @@ from tvclient.protocol import (
     SandboxCandidate,
     SandboxCandidates,
     SandboxEvictionRecord,
+    SiblingGroups,
     TVCacheServerError,
     UnrefResult,
 )
@@ -199,6 +200,20 @@ class TVCacheClient:
         )
         response = self._expect(response, LeaseResponse)
         return SandboxLease(self, task_id, response.sandbox_path, response.sandbox_id)
+
+    async def list_sibling_groups(
+        self, task_id: str, depth: int, threshold: float
+    ) -> SiblingGroups:
+        """Lists similar siblings at depth that may still need comparing.
+
+        A pair qualifies when its score is at or above threshold and at least one
+        side is red. Depth 1 is the root's children. deeper_nodes_exist says
+        whether the graph has nodes below depth, even when no group qualifies.
+        """
+        response = await self._send_request(
+            protocol.encode_list_sibling_groups(task_id, depth, threshold)
+        )
+        return self._expect(response, SiblingGroups)
 
     async def unref_sandbox(self, task_id: str, sandbox_id: str) -> int:
         response = await self._send_request(

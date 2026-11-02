@@ -17,6 +17,10 @@ from tvclient.protocol import (
     ReclaimableSandbox,
     SandboxCandidate,
     SandboxEvictionRecord,
+    Sibling,
+    SiblingGroup,
+    SiblingGroups,
+    SimilarPair,
     TVCacheServerError,
 )
 from tvclient.tool_call import TestToolCall, ToolCall
@@ -36,6 +40,10 @@ __all__ = [
     "SandboxLease",
     "SandboxManager",
     "SentenceTransformerEmbedder",
+    "Sibling",
+    "SiblingGroup",
+    "SiblingGroups",
+    "SimilarPair",
     "TestToolCall",
     "ToolCall",
     "Sandbox",
