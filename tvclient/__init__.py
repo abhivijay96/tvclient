@@ -1,6 +1,6 @@
 """tvclient: async Python client library for the TVCache server."""
 
-from tvclient.client import FindResult, TVCacheClient
+from tvclient.client import FindResult, SandboxLease, TVCacheClient
 from tvclient.embedding import (
     Embedder,
     SentenceTransformerEmbedder,
@@ -33,6 +33,7 @@ __all__ = [
     "ROOT_ENV_ID",
     "SandboxCandidate",
     "SandboxEvictionRecord",
+    "SandboxLease",
     "SandboxManager",
     "SentenceTransformerEmbedder",
     "TestToolCall",

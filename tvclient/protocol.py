@@ -22,6 +22,7 @@ DRAIN_RECLAIMABLE_SANDBOXES_REQUEST = 7
 LIST_HOT_SANDBOXES_REQUEST = 8
 REPORT_FORK_COST_REQUEST = 9
 GET_FORK_COST_REQUEST = 10
+LEASE_SANDBOX_REQUEST = 11
 
 INSERT_RESULT_RESPONSE = 1
 FIND_RESULT_RESPONSE = 2
@@ -32,6 +33,7 @@ MARK_SANDBOXES_EVICTED_RESULT_RESPONSE = 6
 SANDBOX_CANDIDATES_RESPONSE = 7
 RECLAIMABLE_SANDBOXES_RESPONSE = 8
 FORK_COST_RESPONSE = 9
+LEASE_RESULT_RESPONSE = 10
 
 
 class TVCacheServerError(Exception):
@@ -47,6 +49,12 @@ class InsertResult:
 @dataclass(frozen=True)
 class FindResponse:
     value: Optional[str]
+    sandbox_path: Optional[List[str]]
+    sandbox_id: Optional[str]
+
+
+@dataclass(frozen=True)
+class LeaseResponse:
     sandbox_path: Optional[List[str]]
     sandbox_id: Optional[str]
 
@@ -193,6 +201,12 @@ def encode_insert(
 
 def encode_find(task_id: str, path: List[str]) -> bytes:
     return write_u8(FIND_REQUEST) + write_string_u16(task_id) + write_path(path)
+
+
+def encode_lease_sandbox(task_id: str, path: List[str]) -> bytes:
+    return (
+        write_u8(LEASE_SANDBOX_REQUEST) + write_string_u16(task_id) + write_path(path)
+    )
 
 
 def encode_dump_all() -> bytes:
@@ -354,5 +368,11 @@ async def decode_response(reader: asyncio.StreamReader) -> object:
 
     if response_type == FORK_COST_RESPONSE:
         return ForkCost(fork_cost_ms=await read_u32(reader))
+
+    if response_type == LEASE_RESULT_RESPONSE:
+        return LeaseResponse(
+            sandbox_path=await read_optional_path(reader),
+            sandbox_id=await read_optional_string_u16(reader),
+        )
 
     raise ValueError(f"unknown response type: {response_type}")
