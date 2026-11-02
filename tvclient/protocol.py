@@ -23,6 +23,7 @@ REPORT_FORK_COST_REQUEST = 9
 GET_FORK_COST_REQUEST = 10
 LEASE_SANDBOX_REQUEST = 11
 LIST_SIBLING_GROUPS_REQUEST = 12
+APPLY_CONTRACTION_REQUEST = 13
 
 INSERT_RESULT_RESPONSE = 1
 FIND_RESULT_RESPONSE = 2
@@ -35,6 +36,7 @@ RECLAIMABLE_SANDBOXES_RESPONSE = 8
 FORK_COST_RESPONSE = 9
 LEASE_RESULT_RESPONSE = 10
 SIBLING_GROUPS_RESPONSE = 11
+CONTRACTION_RESULT_RESPONSE = 12
 
 
 class TVCacheServerError(Exception):
@@ -141,6 +143,14 @@ class SiblingGroup:
 class SiblingGroups:
     deeper_nodes_exist: bool
     groups: List[SiblingGroup]
+
+
+@dataclass(frozen=True)
+class ContractionResult:
+    """Classes that merged two or more children, and class calls with no child."""
+
+    merged_classes: int
+    skipped_calls: int
 
 
 @dataclass(frozen=True)
@@ -254,6 +264,19 @@ def encode_list_sibling_groups(task_id: str, depth: int, threshold: float) -> by
         + write_u16(depth)
         + struct.pack(">f", threshold)
     )
+
+
+def encode_apply_contraction(
+    task_id: str, parent_path: List[str], classes: List[List[str]], settled: List[str]
+) -> bytes:
+    encoded = write_u8(APPLY_CONTRACTION_REQUEST)
+    encoded += write_string_u16(task_id)
+    encoded += write_path(parent_path)
+    encoded += write_u16(len(classes))
+    for calls in classes:
+        encoded += write_path(calls)
+    encoded += write_path(settled)
+    return encoded
 
 
 def encode_dump_all() -> bytes:
@@ -453,6 +476,12 @@ async def decode_response(reader: asyncio.StreamReader) -> object:
         return SiblingGroups(
             deeper_nodes_exist=deeper_nodes_exist,
             groups=[await read_sibling_group(reader) for _ in range(count)],
+        )
+
+    if response_type == CONTRACTION_RESULT_RESPONSE:
+        return ContractionResult(
+            merged_classes=await read_u32(reader),
+            skipped_calls=await read_u32(reader),
         )
 
     raise ValueError(f"unknown response type: {response_type}")

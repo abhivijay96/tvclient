@@ -12,6 +12,7 @@ from tvclient.executor import TvcacheToolExecutor
 from tvclient.fork_bank import ROOT_ENV_ID, AbstractForkGenerator, ForkBank
 from tvclient.manager import SandboxManager
 from tvclient.protocol import (
+    ContractionResult,
     FindResponse,
     InsertResult,
     ReclaimableSandbox,
@@ -27,6 +28,7 @@ from tvclient.tool_call import TestToolCall, ToolCall
 
 __all__ = [
     "AbstractForkGenerator",
+    "ContractionResult",
     "Embedder",
     "TvcacheToolExecutor",
     "FindResponse",

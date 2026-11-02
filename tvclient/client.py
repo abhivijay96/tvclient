@@ -13,6 +13,7 @@ from typing import List, Optional, TypeVar
 
 from tvclient import protocol
 from tvclient.protocol import (
+    ContractionResult,
     FindResponse,
     ForkCost,
     InsertResult,
@@ -214,6 +215,25 @@ class TVCacheClient:
             protocol.encode_list_sibling_groups(task_id, depth, threshold)
         )
         return self._expect(response, SiblingGroups)
+
+    async def apply_contraction(
+        self,
+        task_id: str,
+        parent_path: List[str],
+        classes: List[List[str]],
+        settled: List[str],
+    ) -> ContractionResult:
+        """Merges classes of siblings under parent_path, then settles the named ones.
+
+        A child is named by any of its calls. Each class merges into its first
+        remaining member. Settled children turn blue after all merges. Class
+        calls that find no child are counted as skipped, all of them when the
+        parent or task is missing. Settled calls that find no child are ignored.
+        """
+        response = await self._send_request(
+            protocol.encode_apply_contraction(task_id, parent_path, classes, settled)
+        )
+        return self._expect(response, ContractionResult)
 
     async def unref_sandbox(self, task_id: str, sandbox_id: str) -> int:
         response = await self._send_request(
