@@ -5,6 +5,8 @@ from tvclient.sandbox import Sandbox
 from tvclient.executor import TvcacheToolExecutor
 from tvclient.fork_bank import ROOT_ENV_ID, AbstractForkGenerator, ForkBank
 from tvclient.manager import SandboxManager
+from tvclient.observer import ExecutionObserver, LookupContext
+from tvclient.passthrough import NoCacheToolExecutor
 from tvclient.protocol import (
     FindResponse,
     InsertResult,
@@ -17,6 +19,9 @@ from tvclient.tool_call import TestToolCall, ToolCall
 
 __all__ = [
     "AbstractForkGenerator",
+    "ExecutionObserver",
+    "LookupContext",
+    "NoCacheToolExecutor",
     "TvcacheToolExecutor",
     "FindResponse",
     "FindResult",
