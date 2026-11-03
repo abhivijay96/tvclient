@@ -1,8 +1,17 @@
 """Graph contraction, which merges equivalent sibling nodes between rollouts."""
 
 import asyncio
+import json
+import logging
 from collections import deque
-from typing import Deque, Dict, Set, Tuple
+from dataclasses import dataclass
+from typing import Deque, Dict, List, Optional, Set, Tuple, Type
+
+from tvclient.client import SandboxLease, TVCacheClient
+from tvclient.sandbox import Sandbox
+from tvclient.tool_call import ToolCall
+
+logger = logging.getLogger(__name__)
 
 
 class SandboxBudget:
@@ -89,3 +98,111 @@ class SandboxBudget:
         else:
             waiter.cancel()
             self._waiters.remove((task_id, waiter))
+
+
+@dataclass
+class Materialized:
+    """A live sandbox for a node, and how it was built."""
+
+    sandbox: Sandbox
+    restored: bool  # True if it started from a snapshot, False if it started fresh
+    replayed: int  # The number of path calls re-executed after the starting point
+
+
+async def materialize(
+    client: TVCacheClient,
+    env_class: Type[Sandbox],
+    tool_call_class: Type[ToolCall],
+    task_id: str,
+    path: List[str],
+) -> Optional[Materialized]:
+    """Builds a live sandbox at path, or returns None if the workload can't.
+
+    Restores the deepest snapshot on path while leasing it, or starts a fresh
+    sandbox, then replays the rest of path. The sandbox is never snapshotted,
+    and the caller must stop it. Server errors propagate.
+    """
+    started = None
+    try:
+        async with await client.lease_sandbox(task_id, path) as lease:
+            started = await _start(env_class, tool_call_class, task_id, path, lease)
+    except BaseException:
+        if started is not None:
+            sandbox, _, _ = started
+            await _stop_quietly(sandbox)
+        raise
+    if started is None:
+        return None
+    sandbox, calls, restored = started
+    try:
+        for call in calls:
+            result = await sandbox.execute(call)
+            if result.startswith("Failed to execute"):
+                raise RuntimeError(f"replay failed with {result[:200]!r}")
+    except Exception as error:
+        _log_unavailable(task_id, path, error)
+        await _stop_quietly(sandbox)
+        return None
+    except BaseException:
+        await _stop_quietly(sandbox)
+        raise
+    return Materialized(sandbox, restored=restored, replayed=len(calls))
+
+
+async def _start(
+    env_class: Type[Sandbox],
+    tool_call_class: Type[ToolCall],
+    task_id: str,
+    path: List[str],
+    lease: SandboxLease,
+) -> Optional[Tuple[Sandbox, List[ToolCall], bool]]:
+    """Rebuilds the calls to replay, then restores the snapshot or starts fresh.
+
+    Returns None if the workload fails, after stopping any sandbox that went live.
+    """
+    snapshot_id = lease.sandbox_id
+    depth = len(lease.sandbox_path) if snapshot_id is not None else 0
+    env: Optional[Sandbox] = None
+    try:
+        calls = [tool_call_class.from_dict(json.loads(call)) for call in path[depth:]]
+        if snapshot_id is None:
+            env = env_class(task_name=task_id)
+        else:
+            env = env_class(task_name=task_id, env_id=snapshot_id)
+        await env.start()
+        if not _is_live(env, snapshot_id):
+            raise RuntimeError("start() didn't move to a live sandbox")
+    except Exception as error:
+        _log_unavailable(task_id, path, error)
+        await _stop_if_live(env, snapshot_id)
+        return None
+    except BaseException:
+        await _stop_if_live(env, snapshot_id)
+        raise
+    return env, calls, snapshot_id is not None
+
+
+def _log_unavailable(task_id: str, path: List[str], error: Exception) -> None:
+    logger.debug(
+        f"[CONTRACT]: Can't materialize a node at depth {len(path)} "
+        f"in {task_id}: {error!r}"
+    )
+
+
+def _is_live(env: Optional[Sandbox], snapshot_id: Optional[str]) -> bool:
+    """Returns whether env moved to a live sandbox, off the snapshot handle."""
+    return env is not None and env.get_id() not in (None, snapshot_id)
+
+
+async def _stop_if_live(env: Optional[Sandbox], snapshot_id: Optional[str]) -> None:
+    """Stops env only if it went live, so a snapshot is never deleted."""
+    if _is_live(env, snapshot_id):
+        await _stop_quietly(env)
+
+
+async def _stop_quietly(sandbox: Sandbox) -> None:
+    """Stops a live sandbox, logging instead of raising on failure."""
+    try:
+        await sandbox.stop()
+    except Exception as error:
+        logger.warning(f"[CONTRACT]: Can't stop sandbox {sandbox.get_id()}: {error!r}")
