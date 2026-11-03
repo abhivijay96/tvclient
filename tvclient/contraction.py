@@ -4,10 +4,22 @@ import asyncio
 import json
 import logging
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional, Set, Tuple, Type
+from typing import (
+    AsyncIterator,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+)
 
 from tvclient.client import SandboxLease, TVCacheClient
+from tvclient.protocol import Sibling
 from tvclient.sandbox import Sandbox
 from tvclient.tool_call import ToolCall
 
@@ -149,6 +161,98 @@ async def materialize(
     return Materialized(sandbox, restored=restored, replayed=len(calls))
 
 
+class SandboxPool:
+    """Live sandboxes for one sibling group of a job, keyed by child index.
+
+    Holds at most one sandbox per child and two per budget token. When full,
+    it takes an extra token if one is free and no task waits, and otherwise
+    stops the unpinned sandbox whose child has the fewest undecided pairs.
+    """
+
+    def __init__(
+        self,
+        client: TVCacheClient,
+        budget: SandboxBudget,
+        stop: asyncio.Event,
+        env_class: Type[Sandbox],
+        tool_call_class: Type[ToolCall],
+        task_id: str,
+        parent_path: List[str],
+        children: List[Sibling],
+        undecided: Callable[[int], int],
+    ):
+        self._client = client
+        self._budget = budget
+        self._stop = stop
+        self._env_class = env_class
+        self._tool_call_class = tool_call_class
+        self._task_id = task_id
+        self._parent_path = parent_path
+        self._children = children
+        self._undecided = undecided
+        self._live: Dict[int, Sandbox] = {}
+        self._pinned: Set[int] = set()
+        self.restores = self.replays = 0
+        self.unavailable: Set[int] = set()
+
+    def is_live(self, index: int) -> bool:
+        """Returns whether child index has a live sandbox."""
+        return index in self._live
+
+    @asynccontextmanager
+    async def get_pair(
+        self, i: int, j: int
+    ) -> AsyncIterator[Optional[Tuple[Sandbox, Sandbox]]]:
+        """Yields live sandboxes for children i and j, or None if one is unavailable.
+
+        Both stay pinned until the block exits, and one pair is held at a time.
+        Server errors propagate from entering the block, so catch errors from
+        comparing inside it.
+        """
+        if i == j:
+            raise ValueError(f"a pair needs two children, got {i} twice")
+        if not self._budget.tokens_held(self._task_id):
+            raise RuntimeError(f"task {self._task_id} holds no budget tokens")
+        self._pinned.update((i, j))
+        try:
+            first = await self._get(i)
+            second = await self._get(j) if first is not None else None
+            yield None if second is None else (first, second)
+        finally:
+            self._pinned.difference_update((i, j))
+
+    async def clear(self) -> None:
+        """Stops every live sandbox."""
+        while self._live:
+            _, sandbox = self._live.popitem()
+            await _stop_quietly(sandbox)
+
+    async def _get(self, index: int) -> Optional[Sandbox]:
+        if index in self._live:
+            return self._live[index]
+        if len(self._live) >= 2 * self._budget.tokens_held(self._task_id):
+            if not await self._budget.take_token(self._task_id, self._stop):
+                await self._evict()
+        path = self._parent_path + [self._children[index].calls[0]]
+        made = await materialize(
+            self._client, self._env_class, self._tool_call_class, self._task_id, path
+        )
+        if made is None:
+            self.unavailable.add(index)
+            return None
+        self.restores += made.restored
+        self.replays += made.replayed
+        self._live[index] = made.sandbox
+        return made.sandbox
+
+    async def _evict(self) -> None:
+        unpinned = [index for index in self._live if index not in self._pinned]
+        if not unpinned:
+            raise RuntimeError("every live sandbox is pinned")
+        victim = min(unpinned, key=self._undecided)
+        await _stop_quietly(self._live.pop(victim))
+
+
 async def _start(
     env_class: Type[Sandbox],
     tool_call_class: Type[ToolCall],
@@ -201,8 +305,11 @@ async def _stop_if_live(env: Optional[Sandbox], snapshot_id: Optional[str]) -> N
 
 
 async def _stop_quietly(sandbox: Sandbox) -> None:
-    """Stops a live sandbox, logging instead of raising on failure."""
+    """Stops a live sandbox, logging instead of raising on failure.
+
+    The stop is shielded, so cancelling the caller doesn't leave it half done.
+    """
     try:
-        await sandbox.stop()
+        await asyncio.shield(sandbox.stop())
     except Exception as error:
         logger.warning(f"[CONTRACT]: Can't stop sandbox {sandbox.get_id()}: {error!r}")
