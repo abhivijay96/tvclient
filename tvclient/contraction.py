@@ -19,7 +19,7 @@ from typing import (
 )
 
 from tvclient.client import SandboxLease, TVCacheClient
-from tvclient.protocol import Sibling
+from tvclient.protocol import Sibling, SimilarPair
 from tvclient.sandbox import Sandbox
 from tvclient.tool_call import ToolCall
 
@@ -251,6 +251,105 @@ class SandboxPool:
             raise RuntimeError("every live sandbox is pinned")
         victim = min(unpinned, key=self._undecided)
         await _stop_quietly(self._live.pop(victim))
+
+
+@dataclass
+class GroupResult:
+    """What to send apply_contraction for one sibling group.
+
+    A lone blue child is already settled, so it's left out of settled.
+    """
+
+    classes: List[List[str]]  # One call per member of each class of two or more
+    settled: List[str]  # One call per member of each fully compared class
+
+
+class EquivalenceTracker:
+    """Equal classes and known inequalities among one group's children.
+
+    Children are named by group index. A pair is decided once both children
+    are in one class or their classes are known unequal, so decisions are
+    inferred through equality and inequality.
+    """
+
+    def __init__(self, children: List[Sibling], pairs: List[SimilarPair]):
+        self._children = children
+        self._pairs = [(pair.i, pair.j) for pair in pairs]
+        self._parent = list(range(len(children)))
+        self._unequal: Dict[int, Set[int]] = {}  # Class root to roots known unequal
+        self._neighbors: List[List[int]] = [[] for _ in children]
+        for i, j in self._pairs:
+            self._neighbors[i].append(j)
+            self._neighbors[j].append(i)
+
+    def is_decided(self, i: int, j: int) -> bool:
+        """Returns whether children i and j are known equal or unequal."""
+        a, b = self._root(i), self._root(j)
+        return a == b or b in self._unequal.get(a, ())
+
+    def undecided(self, index: int) -> int:
+        """Counts the undecided pairs that touch child index."""
+        return sum(not self.is_decided(index, k) for k in self._neighbors[index])
+
+    def mark_equal(self, i: int, j: int) -> None:
+        """Joins the classes of children i and j.
+
+        Raises ValueError if they're already known unequal.
+        """
+        a, b = self._root(i), self._root(j)
+        if a == b:
+            return
+        if b in self._unequal.get(a, ()):
+            raise ValueError(f"children {i} and {j} are already known unequal")
+        if len(self._unequal.get(a, ())) < len(self._unequal.get(b, ())):
+            a, b = b, a  # Moves the smaller set of inequalities
+        self._parent[b] = a
+        for other in self._unequal.pop(b, set()):
+            self._unequal[other].discard(b)
+            self._unequal[other].add(a)
+            self._unequal.setdefault(a, set()).add(other)
+
+    def mark_unequal(self, i: int, j: int) -> None:
+        """Records that the classes of children i and j differ.
+
+        Raises ValueError if they're already known equal.
+        """
+        a, b = self._root(i), self._root(j)
+        if a == b:
+            raise ValueError(f"children {i} and {j} are already known equal")
+        self._unequal.setdefault(a, set()).add(b)
+        self._unequal.setdefault(b, set()).add(a)
+
+    def result(self) -> GroupResult:
+        """Lists classes to merge and the calls of fully compared classes.
+
+        A class is fully compared when every pair touching any member is
+        decided. A merged class is settled whole or not at all, and a lone
+        child is settled only if it's red.
+        """
+        members: Dict[int, List[int]] = {}
+        for index in range(len(self._children)):
+            members.setdefault(self._root(index), []).append(index)
+        unfinished = set()
+        for i, j in self._pairs:
+            if not self.is_decided(i, j):
+                unfinished.update((self._root(i), self._root(j)))
+        result = GroupResult(classes=[], settled=[])
+        for root, indexes in members.items():
+            if len(indexes) == 1 and self._children[root].settled:
+                continue
+            calls = [self._children[index].calls[0] for index in indexes]
+            if len(indexes) > 1:
+                result.classes.append(calls)
+            if root not in unfinished:
+                result.settled.extend(calls)
+        return result
+
+    def _root(self, index: int) -> int:
+        while self._parent[index] != index:
+            self._parent[index] = self._parent[self._parent[index]]
+            index = self._parent[index]
+        return index
 
 
 async def _start(
