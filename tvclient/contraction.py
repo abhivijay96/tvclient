@@ -19,7 +19,7 @@ from typing import (
 )
 
 from tvclient.client import SandboxLease, TVCacheClient
-from tvclient.protocol import Sibling, SimilarPair
+from tvclient.protocol import Sibling, SiblingGroup, SimilarPair
 from tvclient.sandbox import Sandbox
 from tvclient.tool_call import ToolCall
 
@@ -416,6 +416,110 @@ async def _compare_pair(
     else:
         tracker.mark_unequal(pair.i, pair.j)
     return True
+
+
+@dataclass
+class JobSummary:
+    """Counts for one contraction job, filled in as it runs."""
+
+    deepest_depth: int = 0  # The deepest depth whose groups were listed
+    comparisons: int = 0
+    merges: int = 0  # Classes the server merged
+    restores: int = 0
+    replays: int = 0  # Path calls re-executed
+    unavailable: int = 0  # Children that couldn't be built
+
+
+async def run_job(
+    budget: SandboxBudget,
+    stop: asyncio.Event,
+    env_class: Type[Sandbox],
+    tool_call_class: Type[ToolCall],
+    task_id: str,
+    threshold: float,
+    host: str,
+    port: int,
+    summary: JobSummary,
+) -> None:
+    """Contracts task_id depth by depth until no deeper nodes exist or stop is set.
+
+    Uses its own client. Applies each group before the next, including a group
+    cut short by stop. A server connection failure is logged and ends the job.
+    Other errors propagate.
+    """
+    if stop.is_set():
+        return
+    try:
+        async with TVCacheClient(host, port) as client:
+            depth = 1
+            while not stop.is_set():
+                listing = await client.list_sibling_groups(task_id, depth, threshold)
+                summary.deepest_depth = depth
+                for group in listing.groups:
+                    await _contract_group(
+                        client,
+                        budget,
+                        stop,
+                        env_class,
+                        tool_call_class,
+                        task_id,
+                        group,
+                        summary,
+                    )
+                    if stop.is_set():
+                        return
+                if not listing.deeper_nodes_exist:
+                    return
+                depth += 1
+    except (OSError, EOFError, asyncio.TimeoutError) as error:
+        logger.warning(
+            f"[CONTRACT]: Can't reach the server while contracting {task_id}: {error!r}"
+        )
+
+
+async def _contract_group(
+    client: TVCacheClient,
+    budget: SandboxBudget,
+    stop: asyncio.Event,
+    env_class: Type[Sandbox],
+    tool_call_class: Type[ToolCall],
+    task_id: str,
+    group: SiblingGroup,
+    summary: JobSummary,
+) -> None:
+    """Compares one group's pairs with a fresh pool, then applies the result.
+
+    Does nothing if stop is set before the group gets a token.
+    """
+    if not await budget.take_token(task_id, stop):
+        return
+    try:
+        tracker = EquivalenceTracker(group.children, group.pairs)
+        pool = SandboxPool(
+            client,
+            budget,
+            stop,
+            env_class,
+            tool_call_class,
+            task_id,
+            group.parent_path,
+            group.children,
+            tracker.undecided,
+        )
+        try:
+            summary.comparisons += await compare_group(group.pairs, tracker, pool, stop)
+        finally:
+            summary.restores += pool.restores
+            summary.replays += pool.replays
+            summary.unavailable += len(pool.unavailable)
+            await pool.clear()
+    finally:
+        budget.release_tokens(task_id)
+    result = tracker.result()
+    applied = await client.apply_contraction(
+        task_id, group.parent_path, result.classes, result.settled
+    )
+    summary.merges += applied.merged_classes
 
 
 async def _start(
