@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import math
+import numbers
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -227,10 +229,16 @@ class SandboxPool:
             self._pinned.difference_update((i, j))
 
     async def clear(self) -> None:
-        """Stops every live sandbox."""
+        """Stops every live sandbox, then re-raises any cancellation it caught."""
+        cancelled = None
         while self._live:
             _, sandbox = self._live.popitem()
-            await _stop_quietly(sandbox)
+            try:
+                await _stop_quietly(sandbox)
+            except asyncio.CancelledError as error:
+                cancelled = error
+        if cancelled is not None:
+            raise cancelled
 
     async def _get(self, index: int) -> Optional[Sandbox]:
         if index in self._live:
@@ -439,6 +447,7 @@ async def run_job(
     threshold: float,
     host: str,
     port: int,
+    timeout: float,
     summary: JobSummary,
 ) -> None:
     """Contracts task_id depth by depth until no deeper nodes exist or stop is set.
@@ -450,7 +459,7 @@ async def run_job(
     if stop.is_set():
         return
     try:
-        async with TVCacheClient(host, port) as client:
+        async with TVCacheClient(host, port, timeout) as client:
             depth = 1
             while not stop.is_set():
                 listing = await client.list_sibling_groups(task_id, depth, threshold)
@@ -522,6 +531,113 @@ async def _contract_group(
     summary.merges += applied.merged_classes
 
 
+class Contractor:
+    """Runs one contraction job per task while its rollouts are paused.
+
+    Call start(task_id) when a task's rollouts finish, and await stop(task_id)
+    before scheduling its next rollouts. Jobs share one sandbox budget, and
+    each job has its own client and stop event. timeout is each client's
+    request timeout in seconds.
+    """
+
+    def __init__(
+        self,
+        env_class: Type[Sandbox],
+        tool_call_class: Type[ToolCall],
+        similarity_threshold: float,
+        max_sandboxes: int,
+        host: str = "127.0.0.1",
+        port: int = 7878,
+        timeout: float = 5,
+    ):
+        if not (_is_number(similarity_threshold) and -1 <= similarity_threshold <= 1):
+            raise ValueError(
+                "similarity_threshold must be a finite number from -1 to 1, "
+                f"got {similarity_threshold!r}"
+            )
+        if not (_is_number(timeout) and 0 < timeout < math.inf):
+            raise ValueError(
+                f"timeout must be a positive finite number, got {timeout!r}"
+            )
+        self._env_class = env_class
+        self._tool_call_class = tool_call_class
+        self._threshold = float(similarity_threshold)
+        self._budget = SandboxBudget(max_sandboxes)
+        self._host = host
+        self._port = port
+        self._timeout = timeout
+        self._jobs: Dict[str, Tuple[asyncio.Task, asyncio.Event]] = {}
+
+    def start(self, task_id: str) -> None:
+        """Starts contracting task_id unless its job is still running or stopping.
+
+        Must be called from a running event loop.
+        """
+        if task_id in self._jobs and not self._jobs[task_id][0].done():
+            return
+        stop = asyncio.Event()
+        job = asyncio.create_task(self._run(task_id, stop))
+        self._jobs[task_id] = (job, stop)
+        job.add_done_callback(lambda done: self._forget(task_id, done))
+
+    async def stop(self, task_id: str) -> None:
+        """Stops task_id's job and waits for its last apply and sandbox cleanup.
+
+        The training loop must await this before scheduling the task's next
+        rollouts. Returns at once if no job is running, and never raises for a
+        crashed job. A sandbox call that hangs keeps it waiting.
+        """
+        if task_id not in self._jobs:
+            return
+        job, stop = self._jobs[task_id]
+        stop.set()
+        await asyncio.wait({job})
+
+    async def close(self) -> None:
+        """Stops every job, including ones started meanwhile, and waits for them.
+
+        Callers must stop calling start first, or this may never return.
+        """
+        while self._jobs:
+            await asyncio.gather(*(self.stop(task_id) for task_id in list(self._jobs)))
+
+    def _forget(self, task_id: str, job: asyncio.Task) -> None:
+        """Removes task_id's entry if it still belongs to job."""
+        if task_id in self._jobs and self._jobs[task_id][0] is job:
+            del self._jobs[task_id]
+
+    async def _run(self, task_id: str, stop: asyncio.Event) -> None:
+        summary = JobSummary()
+        try:
+            await run_job(
+                self._budget,
+                stop,
+                self._env_class,
+                self._tool_call_class,
+                task_id,
+                self._threshold,
+                self._host,
+                self._port,
+                self._timeout,
+                summary,
+            )
+        except Exception:
+            logger.exception(f"[CONTRACT]: Job for {task_id} crashed")
+        finally:
+            logger.info(
+                f"[CONTRACT]: Job for {task_id} ended at depth "
+                f"{summary.deepest_depth} with {summary.comparisons} comparisons, "
+                f"{summary.merges} merges, {summary.restores} restores, "
+                f"{summary.replays} replayed calls and {summary.unavailable} "
+                "unavailable children"
+            )
+
+
+def _is_number(value: object) -> bool:
+    """Returns whether value is a real number other than a bool."""
+    return isinstance(value, numbers.Real) and not isinstance(value, bool)
+
+
 async def _start(
     env_class: Type[Sandbox],
     tool_call_class: Type[ToolCall],
@@ -574,11 +690,26 @@ async def _stop_if_live(env: Optional[Sandbox], snapshot_id: Optional[str]) -> N
 
 
 async def _stop_quietly(sandbox: Sandbox) -> None:
-    """Stops a live sandbox, logging instead of raising on failure.
+    """Stops a live sandbox and waits for the stop to finish, logging any failure.
 
-    The stop is shielded, so cancelling the caller doesn't leave it half done.
+    A cancellation is re-raised once the stop finishes, so a hung stop delays it.
     """
-    try:
-        await asyncio.shield(sandbox.stop())
-    except Exception as error:
+    stopping = asyncio.ensure_future(_stop(sandbox))
+    cancelled = None
+    while not stopping.done():
+        try:
+            await asyncio.wait({stopping})
+        except asyncio.CancelledError as error:
+            cancelled = error
+    if stopping.cancelled():
+        logger.warning(f"[CONTRACT]: Stopping sandbox {sandbox.get_id()} was cancelled")
+    elif stopping.exception() is not None:
+        error = stopping.exception()
         logger.warning(f"[CONTRACT]: Can't stop sandbox {sandbox.get_id()}: {error!r}")
+    if cancelled is not None:
+        raise cancelled
+
+
+async def _stop(sandbox: Sandbox) -> None:
+    """Awaits sandbox.stop() inside a coroutine, so any error lands in its task."""
+    await sandbox.stop()

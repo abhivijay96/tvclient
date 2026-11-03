@@ -1,6 +1,7 @@
 """tvclient: async Python client library for the TVCache server."""
 
 from tvclient.client import FindResult, SandboxLease, TVCacheClient
+from tvclient.contraction import Contractor
 from tvclient.embedding import (
     Embedder,
     SentenceTransformerEmbedder,
@@ -29,6 +30,7 @@ from tvclient.tool_call import TestToolCall, ToolCall
 __all__ = [
     "AbstractForkGenerator",
     "ContractionResult",
+    "Contractor",
     "Embedder",
     "TvcacheToolExecutor",
     "FindResponse",
