@@ -195,6 +195,11 @@ class SandboxPool:
         self.restores = self.replays = 0
         self.unavailable: Set[int] = set()
 
+    @property
+    def task_id(self) -> str:
+        """The task whose budget tokens this pool uses."""
+        return self._task_id
+
     def is_live(self, index: int) -> bool:
         """Returns whether child index has a live sandbox."""
         return index in self._live
@@ -350,6 +355,67 @@ class EquivalenceTracker:
             self._parent[index] = self._parent[self._parent[index]]
             index = self._parent[index]
         return index
+
+
+async def compare_group(
+    pairs: List[SimilarPair],
+    tracker: EquivalenceTracker,
+    pool: SandboxPool,
+    stop: asyncio.Event,
+) -> int:
+    """Compares pairs one by one until each is decided or dropped, or stop is set.
+
+    Prefers pairs with more live sandboxes, then higher scores. A pair whose
+    equals raises stays undecided and isn't tried again in this call, and
+    neither is any pair of a child that can't be built. A comparison running
+    when stop is set still finishes and counts. Returns how many comparisons
+    finished. Server errors propagate.
+    """
+    pending = pairs
+    comparisons = 0
+    while not stop.is_set():
+        pending = [
+            pair
+            for pair in pending
+            if not tracker.is_decided(pair.i, pair.j)
+            and pair.i not in pool.unavailable
+            and pair.j not in pool.unavailable
+        ]
+        if not pending:
+            break
+        pair = max(
+            pending,
+            key=lambda p: (pool.is_live(p.i) + pool.is_live(p.j), p.score),
+        )
+        if await _compare_pair(pair, tracker, pool):
+            comparisons += 1
+        else:
+            pending.remove(pair)
+        await asyncio.sleep(0)  # Lets other tasks set stop between fast steps
+    return comparisons
+
+
+async def _compare_pair(
+    pair: SimilarPair, tracker: EquivalenceTracker, pool: SandboxPool
+) -> bool:
+    """Compares one pair and records the decision, returning whether it finished."""
+    async with pool.get_pair(pair.i, pair.j) as live:
+        if live is None:
+            return False
+        first, second = live
+        try:
+            equal = await first.equals(second)
+        except Exception as error:
+            logger.debug(
+                f"[CONTRACT]: Can't compare children {pair.i} and {pair.j} "
+                f"in {pool.task_id}: {error!r}"
+            )
+            return False
+    if equal:
+        tracker.mark_equal(pair.i, pair.j)
+    else:
+        tracker.mark_unequal(pair.i, pair.j)
+    return True
 
 
 async def _start(
