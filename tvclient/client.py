@@ -9,47 +9,51 @@ import asyncio
 import json
 import logging
 import time
-from typing import List, Optional
+from typing import List, Optional, TypeVar
 
 from tvclient import protocol
 from tvclient.protocol import (
+    ContractionResult,
     FindResponse,
     ForkCost,
     InsertResult,
     JsonResponse,
+    LeaseResponse,
     MarkResult,
     ReclaimableSandbox,
     ReclaimableSandboxes,
     SandboxCandidate,
     SandboxCandidates,
     SandboxEvictionRecord,
+    SiblingGroups,
     TVCacheServerError,
     UnrefResult,
 )
 
 
-class FindResult:
-    """A find response plus the lease on the returned sandbox.
+LeaseT = TypeVar("LeaseT", bound="SandboxLease")
 
-    The server increments the sandbox's reference count whenever find returns a
-    sandbox_id, so every FindResult must be released exactly once. Use it as an
-    async context manager:
 
-        async with await client.find(task_id, path) as found:
-            ...  # fork here; the snapshot cannot be reclaimed while leased
+class SandboxLease:
+    """A reference on a sandbox snapshot that the server holds until release.
 
-    release() is idempotent and a no-op when there is no sandbox, and it runs
-    even when the body raises, so a crashed rollout cannot pin an eviction
-    victim forever.
+    The snapshot can't be reclaimed while leased. release() is idempotent and a
+    no-op when there is no sandbox. As an async context manager, it releases
+    even when the body raises, so a crash can't pin an eviction victim forever.
     """
 
-    def __init__(self, client: "TVCacheClient", task_id: str, response: FindResponse):
-        self.value = response.value
-        self.sandbox_path = response.sandbox_path
-        self.sandbox_id = response.sandbox_id
+    def __init__(
+        self,
+        client: "TVCacheClient",
+        task_id: str,
+        sandbox_path: Optional[List[str]],
+        sandbox_id: Optional[str],
+    ):
+        self.sandbox_path = sandbox_path
+        self.sandbox_id = sandbox_id
         self._client = client
         self._task_id = task_id
-        self._released = response.sandbox_id is None
+        self._released = sandbox_id is None
 
     async def release(self) -> None:
         """Decrements the sandbox's reference count on the server (at most once)."""
@@ -58,11 +62,27 @@ class FindResult:
         self._released = True
         await self._client.unref_sandbox(self._task_id, self.sandbox_id)
 
-    async def __aenter__(self) -> "FindResult":
+    async def __aenter__(self: LeaseT) -> LeaseT:
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, traceback: object) -> None:
         await self.release()
+
+
+class FindResult(SandboxLease):
+    """A find response plus the lease on the returned sandbox.
+
+    The server increments the sandbox's reference count whenever find returns a
+    sandbox_id, so every FindResult must be released exactly once. Use it as an
+    async context manager:
+
+        async with await client.find(task_id, path) as found:
+            ...  # fork here; the snapshot cannot be reclaimed while leased
+    """
+
+    def __init__(self, client: "TVCacheClient", task_id: str, response: FindResponse):
+        super().__init__(client, task_id, response.sandbox_path, response.sandbox_id)
+        self.value = response.value
 
 
 class TVCacheClient:
@@ -150,9 +170,10 @@ class TVCacheClient:
         sandbox_id: Optional[str],
         runtime: int,
         ttl: Optional[int] = None,
+        embedding: Optional[List[float]] = None,
     ) -> InsertResult:
         response = await self._send_request(
-            protocol.encode_insert(task_id, path, value, sandbox_id, runtime, ttl)
+            protocol.encode_insert(task_id, path, value, sandbox_id, runtime, ttl, embedding)
         )
         return self._expect(response, InsertResult)
 
@@ -169,6 +190,50 @@ class TVCacheClient:
         reference count and the caller owns the matching unref_sandbox call."""
         response = await self._send_request(protocol.encode_find(task_id, path))
         return self._expect(response, FindResponse)
+
+    async def lease_sandbox(self, task_id: str, path: List[str]) -> SandboxLease:
+        """Leases the deepest snapshot on path without counting a cache hit.
+
+        Use as `async with await client.lease_sandbox(task_id, path) as lease:`.
+        """
+        response = await self._send_request(
+            protocol.encode_lease_sandbox(task_id, path)
+        )
+        response = self._expect(response, LeaseResponse)
+        return SandboxLease(self, task_id, response.sandbox_path, response.sandbox_id)
+
+    async def list_sibling_groups(
+        self, task_id: str, depth: int, threshold: float
+    ) -> SiblingGroups:
+        """Lists similar siblings at depth that may still need comparing.
+
+        A pair qualifies when its score is at or above threshold and at least one
+        side is red. Depth 1 is the root's children. deeper_nodes_exist says
+        whether the graph has nodes below depth, even when no group qualifies.
+        """
+        response = await self._send_request(
+            protocol.encode_list_sibling_groups(task_id, depth, threshold)
+        )
+        return self._expect(response, SiblingGroups)
+
+    async def apply_contraction(
+        self,
+        task_id: str,
+        parent_path: List[str],
+        classes: List[List[str]],
+        settled: List[str],
+    ) -> ContractionResult:
+        """Merges classes of siblings under parent_path, then settles the named ones.
+
+        A child is named by any of its calls. Each class merges into its first
+        remaining member. Settled children turn blue after all merges. Class
+        calls that find no child are counted as skipped, all of them when the
+        parent or task is missing. Settled calls that find no child are ignored.
+        """
+        response = await self._send_request(
+            protocol.encode_apply_contraction(task_id, parent_path, classes, settled)
+        )
+        return self._expect(response, ContractionResult)
 
     async def unref_sandbox(self, task_id: str, sandbox_id: str) -> int:
         response = await self._send_request(

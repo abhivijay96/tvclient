@@ -58,6 +58,16 @@ class Sandbox(ABC):
         """Executes one tool call in this sandbox and returns its result."""
         ...
 
+    async def equals(self, other: "Sandbox") -> bool:
+        """Returns whether this live sandbox's state matches other's.
+
+        Both sandboxes must be live (started). Each workload decides which
+        state counts, for example ignoring timestamps, but the result should
+        behave like equality. Comparing must not change the compared state.
+        The default raises NotImplementedError.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement equals")
+
     @abstractmethod
     async def stop(self) -> None:
         """Stops and deletes this sandbox."""

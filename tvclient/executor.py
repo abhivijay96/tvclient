@@ -4,11 +4,13 @@ import asyncio
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple, Type
 
 from tvclient.client import FindResult, TVCacheClient
 from tvclient.sandbox import Sandbox
 from tvclient.fork_bank import ROOT_ENV_ID, AbstractForkGenerator
+from tvclient.protocol import validate_embedding
 from tvclient.snapshot_policy import (
     INITIAL_FORK_COST_SECONDS,
     SNAPSHOT_COST_MULTIPLIER,
@@ -17,6 +19,18 @@ from tvclient.snapshot_policy import (
 from tvclient.tool_call import TestToolCall, ToolCall
 
 MAX_RUNTIME_MS = 2**32
+
+_embedding_pool: Optional[ThreadPoolExecutor] = None
+_embedding_pool_pid: Optional[int] = None
+
+
+def _get_embedding_pool() -> ThreadPoolExecutor:
+    """Returns this process's embedding thread."""
+    global _embedding_pool, _embedding_pool_pid
+    if _embedding_pool_pid != os.getpid():
+        _embedding_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tvclient-embed")
+        _embedding_pool_pid = os.getpid()
+    return _embedding_pool
 
 
 class TvcacheToolExecutor:
@@ -40,12 +54,15 @@ class TvcacheToolExecutor:
         snapshot_cost_multiplier: float = SNAPSHOT_COST_MULTIPLIER,
         initial_fork_cost_seconds: float = INITIAL_FORK_COST_SECONDS,
         ttl: Optional[int] = None,
+        embed_tool_calls: bool = False,
     ):
         self.client = TVCacheClient(host, port)
         self.tool_call_env_class = tool_call_env_class
         self.tool_call_class = tool_call_class
         self.task_name = task_id
         self.ttl = ttl
+        self.embed_tool_calls = embed_tool_calls
+        self._embedding_failed = False
         # Owns the un-checkpointed replay cost and the adaptive snapshot
         # threshold (backed by the server-side fork-cost EMA).
         self.snapshot_policy = SnapshotPolicy(
@@ -248,12 +265,15 @@ class TvcacheToolExecutor:
         for offset, tool_call in enumerate(suffix_calls):
             depth = resume_depth + offset + 1
             self.total_executions += 1
+            embedding_future = self._start_embedding(tool_call)
 
             st = time.perf_counter()
             try:
                 value = await environment.execute(tool_call)
             except Exception:
                 # The sandbox state is unknown after a raised execution.
+                if embedding_future is not None:
+                    embedding_future.cancel()
                 self.logger.debug(
                     f"[TOOL EXEC]: Execution raised; discarding environment "
                     f"{environment.get_id()} for rollout {self.rollout_id}"
@@ -282,11 +302,13 @@ class TvcacheToolExecutor:
                     f"[TOOL EXEC]: Not caching failed result at depth {depth} "
                     f"for rollout {self.rollout_id}"
                 )
+                if embedding_future is not None:
+                    embedding_future.cancel()
                 last_value = value
                 continue
             
             await self._update_tvcache_with_execution(
-                tool_call, environment, path, depth, value, runtime_seconds
+                tool_call, environment, path, depth, value, runtime_seconds, embedding_future
             )
             last_value = value
 
@@ -300,6 +322,7 @@ class TvcacheToolExecutor:
         depth: int,
         value: str,
         runtime_seconds: float,
+        embedding_future: Optional[asyncio.Future] = None,
     ) -> None:
 
         sandbox_id = None
@@ -321,6 +344,8 @@ class TvcacheToolExecutor:
             # checkpointed (by the winner), so the replay debt is paid.
             self.snapshot_policy.reset()
 
+        embedding = await self._await_embedding(embedding_future)
+
         ist = time.perf_counter()
         insert_result = await self.client.insert(
             self.task_name,
@@ -329,6 +354,7 @@ class TvcacheToolExecutor:
             sandbox_id,
             runtime=self._runtime_ms(runtime_seconds),
             ttl=self.ttl,
+            embedding=embedding,
         )
         iet = time.perf_counter()
         self.logger.debug(
@@ -345,6 +371,33 @@ class TvcacheToolExecutor:
             self._schedule_stop(
                 self.tool_call_env_class(task_name=self.task_name, env_id=sandbox_id)
             )
+
+    def _start_embedding(self, tool_call: ToolCall) -> Optional[asyncio.Future]:
+        """Embeds a stateful call in the background so it overlaps with execution."""
+        if not self.embed_tool_calls or not tool_call.will_mutate_state():
+            return None
+        future = asyncio.get_running_loop().run_in_executor(_get_embedding_pool(), tool_call.embed)
+        # Marks failures as seen, since failed executions never await their embedding.
+        future.add_done_callback(lambda done: done.cancelled() or done.exception())
+        return future
+
+    async def _await_embedding(
+        self, embedding_future: Optional[asyncio.Future]
+    ) -> Optional[List[float]]:
+        """Returns the finished embedding, or None if there is none or it is invalid.
+        Never raises, so a bad embedding can't fail the rollout."""
+        if embedding_future is None:
+            return None
+        try:
+            embedding = list(await embedding_future)
+            validate_embedding(embedding)
+        except Exception as error:
+            # Warn once per executor so a missing embedder isn't silent.
+            log = self.logger.debug if self._embedding_failed else self.logger.warning
+            self._embedding_failed = True
+            log(f"[EMBED]: Skipping embedding due to {error!r} for rollout {self.rollout_id}")
+            return None
+        return embedding
 
     def _replace_rollout_environment(
         self, environment: Sandbox, sandbox_history: List[str]
