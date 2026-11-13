@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import numbers
+import time
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -195,6 +196,9 @@ class SandboxPool:
         self._live: Dict[int, Sandbox] = {}
         self._pinned: Set[int] = set()
         self.restores = self.replays = 0
+        self.fresh_starts = 0  # Children built from a fresh sandbox (no snapshot on the path)
+        self.built_nodes: Set[int] = set()  # Distinct children ever materialized
+        self.equal_comparisons = 0
         self.unavailable: Set[int] = set()
 
     @property
@@ -254,6 +258,8 @@ class SandboxPool:
             self.unavailable.add(index)
             return None
         self.restores += made.restored
+        self.fresh_starts += not made.restored
+        self.built_nodes.add(index)
         self.replays += made.replayed
         self._live[index] = made.sandbox
         return made.sandbox
@@ -420,6 +426,7 @@ async def _compare_pair(
             )
             return False
     if equal:
+        pool.equal_comparisons += 1
         tracker.mark_equal(pair.i, pair.j)
     else:
         tracker.mark_unequal(pair.i, pair.j)
@@ -436,6 +443,17 @@ class JobSummary:
     restores: int = 0
     replays: int = 0  # Path calls re-executed
     unavailable: int = 0  # Children that couldn't be built
+    # Added for the testing plan's per-round metrics.
+    groups: int = 0  # Sibling groups worked on
+    similar_pairs: int = 0  # Similar sibling pairs listed by the server
+    pairs_decided: int = 0  # Of those, decided (compared or inferred)
+    equal_comparisons: int = 0  # Comparisons that found equivalence
+    fresh_starts: int = 0  # Sandboxes built fresh (no snapshot on the path)
+    nodes_built: int = 0  # Distinct nodes whose sandbox was built, per group
+    merged_nodes: int = 0  # Nodes absorbed into another (sum of class size - 1)
+    completed: bool = False  # Reached the bottom of the graph
+    preempted: bool = False  # Stopped before reaching the bottom
+    walltime_s: float = 0.0
 
 
 async def run_job(
@@ -478,6 +496,7 @@ async def run_job(
                     if stop.is_set():
                         return
                 if not listing.deeper_nodes_exist:
+                    summary.completed = True
                     return
                 depth += 1
     except (OSError, EOFError, asyncio.TimeoutError) as error:
@@ -500,6 +519,8 @@ async def _contract_group(
 
     Does nothing if stop is set before the group gets a token.
     """
+    summary.groups += 1
+    summary.similar_pairs += len(group.pairs)
     if not await budget.take_token(task_id, stop):
         return
     try:
@@ -521,6 +542,12 @@ async def _contract_group(
             summary.restores += pool.restores
             summary.replays += pool.replays
             summary.unavailable += len(pool.unavailable)
+            summary.fresh_starts += pool.fresh_starts
+            summary.nodes_built += len(pool.built_nodes)
+            summary.equal_comparisons += pool.equal_comparisons
+            summary.pairs_decided += sum(
+                tracker.is_decided(pair.i, pair.j) for pair in group.pairs
+            )
             await pool.clear()
     finally:
         budget.release_tokens(task_id)
@@ -529,6 +556,8 @@ async def _contract_group(
         task_id, group.parent_path, result.classes, result.settled
     )
     summary.merges += applied.merged_classes
+    if applied.merged_classes:
+        summary.merged_nodes += sum(len(members) - 1 for members in result.classes)
 
 
 class Contractor:
@@ -549,7 +578,9 @@ class Contractor:
         host: str = "127.0.0.1",
         port: int = 7878,
         timeout: float = 5,
+        on_summary: Optional[Callable[[str, "JobSummary"], None]] = None,
     ):
+        """on_summary(task_id, summary) is called when each job ends."""
         if not (_is_number(similarity_threshold) and -1 <= similarity_threshold <= 1):
             raise ValueError(
                 "similarity_threshold must be a finite number from -1 to 1, "
@@ -567,6 +598,7 @@ class Contractor:
         self._port = port
         self._timeout = timeout
         self._jobs: Dict[str, Tuple[asyncio.Task, asyncio.Event]] = {}
+        self._on_summary = on_summary
 
     def start(self, task_id: str) -> None:
         """Starts contracting task_id unless its job is still running or stopping.
@@ -608,6 +640,7 @@ class Contractor:
 
     async def _run(self, task_id: str, stop: asyncio.Event) -> None:
         summary = JobSummary()
+        started = time.perf_counter()
         try:
             await run_job(
                 self._budget,
@@ -624,6 +657,13 @@ class Contractor:
         except Exception:
             logger.exception(f"[CONTRACT]: Job for {task_id} crashed")
         finally:
+            summary.walltime_s = time.perf_counter() - started
+            summary.preempted = stop.is_set() and not summary.completed
+            if self._on_summary is not None:
+                try:
+                    self._on_summary(task_id, summary)
+                except Exception:
+                    logger.exception("[CONTRACT]: on_summary failed")
             logger.info(
                 f"[CONTRACT]: Job for {task_id} ended at depth "
                 f"{summary.deepest_depth} with {summary.comparisons} comparisons, "
