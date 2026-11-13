@@ -74,11 +74,12 @@ class ForkBank(AbstractForkGenerator):
         if task_name not in self.tasks:
             self.tasks.append(task_name)
 
-    async def set_tasks(self, tasks: Iterable[str]) -> None:
-        """Replaces the tasks that get warm roots; roots shelved for tasks that
-        are no longer listed are stopped."""
+    async def set_tasks(self, tasks: Iterable[str], keep: Iterable[str] = ()) -> None:
+        """Replaces the tasks that get warm roots; roots shelved for tasks in
+        neither tasks nor keep (e.g. the batch now running) are stopped."""
         self.tasks = list(dict.fromkeys(tasks))
-        for key in [k for k in self.shelf if k[1] == ROOT_ENV_ID and k[0] not in self.tasks]:
+        kept = set(self.tasks) | set(keep)
+        for key in [k for k in self.shelf if k[1] == ROOT_ENV_ID and k[0] not in kept]:
             await self._stop_all(key[0], self.shelf.pop(key))
 
     def get_forked_env(self, task_name: str, parent_env_id: str) -> Optional[str]:
